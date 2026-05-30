@@ -1,464 +1,610 @@
-"""
-@author: zahraetemad
-(A)COMPLETE THERMODYNAMIC PROPERTIES — ALL SPECIES
-  CH3OH, HCl, CH3Cl, H2O, DME
+"""Packed-bed reactor model for methyl chloride synthesis.
 
-  Shomate Equation (NIST convention, t = T/1000):
+The model solves a coupled, non-isothermal PFR with pressure drop and coolant
+heat removal for:
 
-    Cp°(T) = A + B·t + C·t² + D·t³ + E/t²                        [J/mol·K]
-    H°(T)  = A·t + B·t²/2 + C·t³/3 + D·t⁴/4 − E/t + F − H       [kJ/mol]
-             (this is H°(T) − H°₂₉₈, i.e. sensible heat)
-    S°(T)  = A·ln(t) + B·t + C·t²/2 + D·t³/3 − E/(2t²) + G       [J/mol·K]
+    R1: CH3OH + HCl  <-> CH3Cl + H2O
+    R2: 2 CH3OH     <-> DME + H2O
 
-  Species with FULL NIST Shomate coefficients (A–H given):
-    HCl     Chase 1998  298–1200 K
-    CH3Cl   Chase 1998  298–1200 K
-    H2O     Chase 1998  500–1200 K
-
-  Species with tabulated Cp data only (regression fitting):
-    CH3OH   Fit Shomate form to NIST Cp table (200–1500 K)
-    DME     Fit Shomate form to NIST Cp table (200–1500 K)
-            H and S derived from fitted coefficients + Hf/S(298) references
-
-  Standard enthalpies of formation Hf(298 K) [kJ/mol]:
-    HCl:-92.307  CH3Cl:-83.680  H2O:-241.826  CH3OH:-205.000  DME:-184.100
-    
-(B) Reactions
-Main reaction:
-   CH3OH + HCl -> CH3Cl + H2O
-
-Side reaction:
-   2 CH3OH <-> DME + H2O
-
+Run:
+    python reactor_model.py
 """
 
-import numpy as np
+from __future__ import annotations
+
+import argparse
+import os
+from dataclasses import dataclass, replace
+from pathlib import Path
+
+os.environ.setdefault("MPLCONFIGDIR", str(Path.cwd() / ".matplotlib-cache"))
+
+import matplotlib
+
+matplotlib.use("Agg")
+
 import matplotlib.pyplot as plt
+import numpy as np
 from scipy.integrate import solve_ivp
 
-# 0) SHOMATE / THERMODYNAMIC CONSTANTS
-# =============================================================================
-c_HCl  = np.array([32.12392, -13.45805,  19.86852, -6.853936, -0.049672,
-                   -101.6206, 228.6866, -92.31201])
-c_MeCl = np.array([3.524690, 136.9277, -82.14196, 20.22797, 0.278032,
-                   -89.19995, 202.8391, -83.68000])
-c_H2O  = np.array([30.09200, 6.832514, 6.793435, -2.534480, 0.082139,
-                   -250.8810, 223.3967, -241.8264])
-c_MeOH = np.array([1.02174, 145.69696, -71.23345, 13.60109, 0.49387,
-                   -4.52149, 203.52073, 0.0])
-c_DME  = np.array([5.42132, 216.58801, -105.26906, 19.60664, 0.39139,
-                   -9.03898, 215.69206, 0.0])
 
-Hf298 = {
-    "MeOH": -205.000,
-    "HCl":  -92.307,
-    "MeCl": -83.680,
-    "H2O":  -241.826,
-    "DME":  -184.100
+# =============================================================================
+# Thermodynamic data
+# =============================================================================
+
+R_GAS = 8.314  # J/mol/K
+T_REF = 298.15  # K
+SMALL = 1.0e-14
+
+SHOMATE = {
+    "HCl": np.array(
+        [32.12392, -13.45805, 19.86852, -6.853936, -0.049672, -101.6206, 228.6866, -92.31201]
+    ),
+    "MeCl": np.array(
+        [3.524690, 136.9277, -82.14196, 20.22797, 0.278032, -89.19995, 202.8391, -83.68000]
+    ),
+    "H2O": np.array(
+        [30.09200, 6.832514, 6.793435, -2.534480, 0.082139, -250.8810, 223.3967, -241.8264]
+    ),
+    "MeOH": np.array(
+        [1.02174, 145.69696, -71.23345, 13.60109, 0.49387, -4.52149, 203.52073, 0.0]
+    ),
+    "DME": np.array(
+        [5.42132, 216.58801, -105.26906, 19.60664, 0.39139, -9.03898, 215.69206, 0.0]
+    ),
 }
 
-dHf_R1 = Hf298["MeCl"] + Hf298["H2O"] - Hf298["MeOH"] - Hf298["HCl"]
-dHf_R2 = Hf298["DME"]  + Hf298["H2O"] - 2 * Hf298["MeOH"]
+FORMATION_ENTHALPY_298 = {
+    "MeOH": -205.000,  # kJ/mol
+    "HCl": -92.307,
+    "MeCl": -83.680,
+    "H2O": -241.826,
+    "DME": -184.100,
+}
+
+MOLECULAR_WEIGHT = {
+    "MeOH": 32.04e-3,  # kg/mol
+    "HCl": 36.4606e-3,
+    "MeCl": 50.4875e-3,
+    "H2O": 18.0153e-3,
+    "DME": 46.069e-3,
+}
+
+SPECIES = ("MeOH", "HCl", "MeCl", "H2O", "DME")
 
 
-# 1) CONSTANTS AND OPERATING CONDITIONS
-# =============================================================================
-R_gas = 8.314
-T0    = 280 + 273.15
-Ta0   = 260 + 273.15
-P_bar = 5.0
-P0    = P_bar * 1e5
+@dataclass(frozen=True)
+class ReactorConfig:
+    """Operating conditions, geometry, and transport assumptions."""
 
-# 2) BED / TUBE PROPERTIES
-# =============================================================================
-eps   = 0.52
-rho_b = 570.0
-#rho_b=(1-eps)*rho_b
-#rho_b=rho_b/(1-eps)
-Dp    = 0.0035
-Dc    = 8 * Dp
-Ac    = np.pi / 4.0 * Dc**2
+    reactor_volume: float = 10.0  # m3 total packed-bed volume
+    tube_length: float = 8.0  # m
+    void_fraction: float = 0.52
+    bulk_density: float = 570.0  # kg catalyst / m3 packed bed
+    particle_diameter: float = 0.0035  # m
+    tube_to_particle_diameter: float = 8.0
 
-V_total =10.0
-L_tube  = 8.0
-V_tube  = Ac * L_tube
-n_tubes = int(np.ceil(V_total / V_tube))
+    inlet_temperature: float = 280.0 + 273.15  # K
+    coolant_inlet_temperature: float = 260.0 + 273.15  # K
+    pressure_bar: float = 5.0  # bar
 
-W_tube  = rho_b * V_tube
-W_total = rho_b * V_total
+    meoh_feed_kmol_h: float = 152.813
+    hcl_to_meoh_ratio: float = 1.7
 
-# 3) FEED
-# =============================================================================
-FA0 = 152.813 * 1000.0 / 3600.0
-FB0 = FA0*1.7
+    mixture_viscosity: float = 2.26851e-5  # Pa s
+    overall_heat_transfer: float = 600.0  # W/m2/K
+    coolant_mass_flow: float = 13.0  # kg/s, total plant coolant
+    coolant_heat_capacity: float = 1507.0  # J/kg/K
 
-MW_MeOH = 32.04e-3
-MW_HCl  = 36.4606e-3
-MW_MeCl = 50.4875e-3
-MW_H2O  = 18.0153e-3
-MW_DME  = 46.069e-3
-
-m_dot      = FA0 * MW_MeOH + FB0 * MW_HCl
-m_dot_tube = m_dot / n_tubes
-
-mu_mix    = 2.26851e-5
-MW_mix_in = (FA0 * MW_MeOH + FB0 * MW_HCl) / (FA0 + FB0)
-rho0_mix  = P0 * MW_mix_in / (R_gas * T0)
-
-G = m_dot_tube / Ac
-
-# 4) COOLANT PROPERTIES
-# =============================================================================
-m_dot_cool = 13.0      # kg/s coolant
-Cp_cool    = 1507.0    # J/kg/K coolant Cp
-
-# 5) MIXTURE MOLECULAR WEIGHT
-# =============================================================================
-def mixture_mw(FA, FB, FP, FW, FE):
-    FT = FA + FB + FP + FW + FE
-    if FT <= 0.0:
-        return MW_mix_in
-    return (FA*MW_MeOH + FB*MW_HCl + FP*MW_MeCl + FW*MW_H2O + FE*MW_DME) / FT
+    points: int = 1000
+    rtol: float = 1.0e-6
+    atol: float = 1.0e-8
 
 
-# 6) COUPLED PFR + ERGUN ODEs
-# =============================================================================
-alpha_term = (G / Dp) * ((1.0 - eps) / eps**3) * (
-    150.0 * (1.0 - eps) * mu_mix / Dp + 1.75 * G
-)
-dV_dz = Ac * n_tubes
+@dataclass(frozen=True)
+class Geometry:
+    tube_diameter: float
+    tube_area: float
+    tube_volume: float
+    tube_count: int
+    catalyst_mass_total: float
+    catalyst_mass_per_tube: float
+    mass_flux: float
+    pressure_drop_alpha: float
+    total_cross_section: float
+    heat_transfer_area_per_volume: float
 
 
-def coupled_odes(V_vol, y):
-    FA, FB, FP, FW, FE, P, T_loc, Ta_loc = y
+@dataclass(frozen=True)
+class LocalRates:
+    r1: float  # mol/m3/s
+    r2: float  # mol/m3/s
+    dH1: float  # kJ/mol
+    dH2: float  # kJ/mol
+    heat_generation: float  # J/m3/s
 
-    P      = max(P, 1.0)
-    T_loc  = max(T_loc, 10.0)
-    Ta_loc = max(Ta_loc, 10.0)
 
-    # Local total flow
-    # -------------------------------------------------------------------------
-    FT = FA + FB + FP + FW + FE
-    if FT <= 1e-14:
-        return [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+def shomate_h_sensible(coefficients: np.ndarray, temperature: float) -> float:
+    """Return H(T) - H(298.15 K), kJ/mol."""
 
-    P_local_bar = P / 1e5
-
-    pA = FA / FT * P_local_bar   # MeOH
-    pB = FB / FT * P_local_bar   # HCl
-    pP = FP / FT * P_local_bar   # MeCl
-    pW = FW / FT * P_local_bar   # H2O
-    pE = FE / FT * P_local_bar   # DME
-
-    # Local thermodynamics at T_loc
-    # -------------------------------------------------------------------------
-    t = T_loc / 1000.0
-
-    def H_sensible_local(c):
-        return c[0]*t + c[1]*t**2/2 + c[2]*t**3/3 + c[3]*t**4/4 - c[4]/t + c[5] - c[7]
-
-    def S_shomate_local(c):
-        return c[0]*np.log(t) + c[1]*t + c[2]*t**2/2 + c[3]*t**3/3 - c[4]/(2*t**2) + c[6]
-
-    def H_sensible_ref(Tref, c):
-        tref = Tref / 1000.0
-        return c[0]*tref + c[1]*tref**2/2 + c[2]*tref**3/3 + c[3]*tref**4/4 - c[4]/tref + c[5] - c[7]
-
-    T_ref = 298.15
-
-    def Cp_integral_local(c):
-        return H_sensible_local(c) - H_sensible_ref(T_ref, c)
-
-    dHrxn_1 = dHf_R1 + (
-        Cp_integral_local(c_MeCl) + Cp_integral_local(c_H2O)
-        - Cp_integral_local(c_MeOH) - Cp_integral_local(c_HCl)
-    )
-    dHrxn_2 = dHf_R2 + (
-        Cp_integral_local(c_DME) + Cp_integral_local(c_H2O)
-        - 2.0 * Cp_integral_local(c_MeOH)
+    t = temperature / 1000.0
+    return (
+        coefficients[0] * t
+        + coefficients[1] * t**2 / 2.0
+        + coefficients[2] * t**3 / 3.0
+        + coefficients[3] * t**4 / 4.0
+        - coefficients[4] / t
+        + coefficients[5]
+        - coefficients[7]
     )
 
-    dSrxn_1 = (
-        S_shomate_local(c_MeCl) + S_shomate_local(c_H2O)
-        - S_shomate_local(c_MeOH) - S_shomate_local(c_HCl)
-    )
-    dSrxn_2 = (
-        S_shomate_local(c_DME) + S_shomate_local(c_H2O)
-        - 2.0 * S_shomate_local(c_MeOH)
-    )
 
-    dGrxn_1 = dHrxn_1 - T_loc * dSrxn_1 / 1000.0
-    dGrxn_2 = dHrxn_2 - T_loc * dSrxn_2 / 1000.0
+def shomate_entropy(coefficients: np.ndarray, temperature: float) -> float:
+    """Return absolute Shomate entropy, J/mol/K."""
 
-    Ka_eq = np.exp(-dGrxn_1 * 1000.0 / (R_gas * T_loc))
-    Ks_eq = np.exp(-dGrxn_2 * 1000.0 / (R_gas * T_loc))
-
-    # Local kinetics at T_loc
-    # -------------------------------------------------------------------------
-    kA2   = (1.64e5 / 1.01325) * np.exp(-54.4e3    / (R_gas * T_loc))
-    KHCl  = (3.76e-5 / 1.01325) * np.exp( 90.6e3   / (R_gas * T_loc))
-
-    ks    = 1.45088e3 * np.exp(-62338.37 / (R_gas * T_loc))
-    KMeOH = 9.75e-1   * np.exp( 64150.82 / (R_gas * T_loc))
-    KH2O  = 6.53e-1   * np.exp( 5868.85  / (R_gas * T_loc))
-
-    # Local reaction rates at T_loc
-    # -------------------------------------------------------------------------
-    
-    num1   = kA2 * (pB - pP**2 / (pA * Ka_eq))
-    denom1 = max(1.0 + KHCl * pP**2 / (pA * Ka_eq), 1e-14)
-    r1_kgh = num1 / denom1
-    r1     = r1_kgh * 1000.0 / 3600.0 * rho_b   # mol/m3/s
-    #eta1=
-    #r1=r*eta1
-    
-    num2       = ks * KMeOH**2 * (pA**2 - pE * pW / Ks_eq)
-    denom2     = max((1.0 + 2.0*np.sqrt(max(KMeOH * pA, 0.0)) + KH2O*pW)**4, 1e-14)
-    r2_kgh     = num2 / denom2
-    r2         = r2_kgh * 1000.0 / 3600.0 * rho_b   # mol/m3/s
-    
-
-    # Molar balances
-    # -------------------------------------------------------------------------
-    dFA_dV = -r1 - 2.0*r2
-    dFB_dV = -r1
-    dFP_dV =  r1
-    dFW_dV =  r1 + r2
-    dFE_dV =  r2
-
-    # Pressure drop
-    # -------------------------------------------------------------------------
-    MW_mix = mixture_mw(FA / n_tubes, FB / n_tubes, FP / n_tubes,
-                        FW / n_tubes, FE / n_tubes)
-    rho = P * MW_mix / (R_gas * T_loc)
-
-    dPdz  = -alpha_term / max(rho, 1e-12)
-    dP_dV = dPdz / dV_dz
-
-    # Cp at T_loc
-    # -------------------------------------------------------------------------
-    def Cp_shomate_local(c):
-        return c[0] + c[1]*t + c[2]*t**2 + c[3]*t**3 + c[4]/t**2
-
-    Cp_A = Cp_shomate_local(c_MeOH)
-    Cp_B = Cp_shomate_local(c_HCl)
-    Cp_C = Cp_shomate_local(c_MeCl)
-    Cp_D = Cp_shomate_local(c_DME)
-    Cp_E = Cp_shomate_local(c_H2O)
-
-    # Energy balances
-    # -------------------------------------------------------------------------
-    U = 600.0 #w/m2/k
-    a = 4.0 / Dc #1/m
-
-    FCp = FA*Cp_A + FB*Cp_B + FP*Cp_C + FE*Cp_D + FW*Cp_E
-    
-    heat_gen = (r1 * (-dHrxn_1) + r2 * (-dHrxn_2)) * 1000.0   # J/m3/s
-    heat_rem = U * a * (T_loc - Ta_loc)                       # J/m3/s
-
-    dT_dV  = (heat_gen - heat_rem) / max(FCp, 1e-12)
-    dTa_dV = heat_rem / max(m_dot_cool * Cp_cool, 1e-12)
-    return [dFA_dV, dFB_dV, dFP_dV, dFW_dV, dFE_dV, dP_dV, dT_dV, dTa_dV]
-
-# 7) SOLVE COUPLED SYSTEM
-# =============================================================================
-V_eval = np.linspace(0.0, V_total, 1000)
-
-sol = solve_ivp(
-    coupled_odes,
-    (0.0, V_total),
-    [FA0, FB0, 0.0, 0.0, 0.0, P0, T0, Ta0],
-    t_eval=V_eval,
-    method='RK45',     # Runge–Kutta method
-    rtol=1e-6,
-    atol=1e-8
-)
-
-if not sol.success:
-    raise RuntimeError(sol.message)
-
-V_sol = sol.t
-FA, FB, FP, FW, FE, P_sol, T_sol, Ta_sol = sol.y
-
-# 8) POST-PROCESS LOCAL RATES / HEAT PROFILE
-# =============================================================================
-r1_sol = np.zeros_like(V_sol)
-r2_sol = np.zeros_like(V_sol)
-Qg_profile = np.zeros_like(V_sol)
-
-for i in range(len(V_sol)):
-    FAi, FBi, FPi, FWi, FEi = FA[i], FB[i], FP[i], FW[i], FE[i]
-    Pi = max(P_sol[i], 1.0)
-    Ti = max(T_sol[i], 10.0)
-
-    FT = FAi + FBi + FPi + FWi + FEi
-    if FT <= 1e-14:
-        continue
-
-    P_local_bar = Pi / 1e5
-    pA = FAi / FT * P_local_bar
-    pB = FBi / FT * P_local_bar
-    pP = FPi / FT * P_local_bar
-    pW = FWi / FT * P_local_bar
-    pE = FEi / FT * P_local_bar
-
-    t = Ti / 1000.0
-
-    def H_sensible_local(c):
-        return c[0]*t + c[1]*t**2/2 + c[2]*t**3/3 + c[3]*t**4/4 - c[4]/t + c[5] - c[7]
-
-    def S_shomate_local(c):
-        return c[0]*np.log(t) + c[1]*t + c[2]*t**2/2 + c[3]*t**3/3 - c[4]/(2*t**2) + c[6]
-
-    def H_sensible_ref(Tref, c):
-        tref = Tref / 1000.0
-        return c[0]*tref + c[1]*tref**2/2 + c[2]*tref**3/3 + c[3]*tref**4/4 - c[4]/tref + c[5] - c[7]
-
-    T_ref = 298.15
-
-    def Cp_integral_local(c):
-        return H_sensible_local(c) - H_sensible_ref(T_ref, c)
-
-    dHrxn_1 = dHf_R1 + (
-        Cp_integral_local(c_MeCl) + Cp_integral_local(c_H2O)
-        - Cp_integral_local(c_MeOH) - Cp_integral_local(c_HCl)
-    )
-    dHrxn_2 = dHf_R2 + (
-        Cp_integral_local(c_DME) + Cp_integral_local(c_H2O)
-        - 2.0 * Cp_integral_local(c_MeOH)
+    t = temperature / 1000.0
+    return (
+        coefficients[0] * np.log(t)
+        + coefficients[1] * t
+        + coefficients[2] * t**2 / 2.0
+        + coefficients[3] * t**3 / 3.0
+        - coefficients[4] / (2.0 * t**2)
+        + coefficients[6]
     )
 
-    dSrxn_1 = (
-        S_shomate_local(c_MeCl) + S_shomate_local(c_H2O)
-        - S_shomate_local(c_MeOH) - S_shomate_local(c_HCl)
+
+def shomate_cp(coefficients: np.ndarray, temperature: float) -> float:
+    """Return gas heat capacity, J/mol/K."""
+
+    t = temperature / 1000.0
+    return coefficients[0] + coefficients[1] * t + coefficients[2] * t**2 + coefficients[3] * t**3 + coefficients[4] / t**2
+
+
+def reaction_delta_h(temperature: float, products: dict[str, float], reactants: dict[str, float]) -> float:
+    """Reaction enthalpy at temperature, kJ/mol of reaction."""
+
+    def species_enthalpy(species: str) -> float:
+        return FORMATION_ENTHALPY_298[species] + shomate_h_sensible(SHOMATE[species], temperature)
+
+    return sum(nu * species_enthalpy(sp) for sp, nu in products.items()) - sum(
+        nu * species_enthalpy(sp) for sp, nu in reactants.items()
     )
-    dSrxn_2 = (
-        S_shomate_local(c_DME) + S_shomate_local(c_H2O)
-        - 2.0 * S_shomate_local(c_MeOH)
+
+
+def reaction_delta_s(temperature: float, products: dict[str, float], reactants: dict[str, float]) -> float:
+    """Reaction entropy at temperature, J/mol/K."""
+
+    return sum(nu * shomate_entropy(SHOMATE[sp], temperature) for sp, nu in products.items()) - sum(
+        nu * shomate_entropy(SHOMATE[sp], temperature) for sp, nu in reactants.items()
     )
 
-    dGrxn_1 = dHrxn_1 - Ti * dSrxn_1 / 1000.0
-    dGrxn_2 = dHrxn_2 - Ti * dSrxn_2 / 1000.0
 
-    Ka_eq = np.exp(-dGrxn_1 * 1000.0 / (R_gas * Ti))
-    Ks_eq = np.exp(-dGrxn_2 * 1000.0 / (R_gas * Ti))
+def reaction_thermodynamics(temperature: float) -> dict[str, float]:
+    """Return dH, dS, dG, and equilibrium constants for both reactions."""
 
-    kA2   = (1.64e5 / 1.01325) * np.exp(-54.4e3    / (R_gas * Ti))
-    KHCl  = (3.76e-5 / 1.01325) * np.exp( 90.6e3   / (R_gas * Ti))
-    ks    = 1.45088e3 * np.exp(-62338.37 / (R_gas * Ti))
-    KMeOH = 9.75e-1   * np.exp( 64150.82 / (R_gas * Ti))
-    KH2O  = 6.53e-1   * np.exp( 5868.85  / (R_gas * Ti))
+    r1_products = {"MeCl": 1.0, "H2O": 1.0}
+    r1_reactants = {"MeOH": 1.0, "HCl": 1.0}
+    r2_products = {"DME": 1.0, "H2O": 1.0}
+    r2_reactants = {"MeOH": 2.0}
 
-    ratio1 = pP**2 / (pA * Ka_eq) if pA > 1e-14 else 0.0
-    num1   = kA2 * (pB - ratio1)
-    denom1 = max(1.0 + KHCl * ratio1, 1e-14)
-    r1_sol[i] = (num1 / denom1) * 1000.0 / 3600.0 * rho_b
+    dH1 = reaction_delta_h(temperature, r1_products, r1_reactants)
+    dH2 = reaction_delta_h(temperature, r2_products, r2_reactants)
+    dS1 = reaction_delta_s(temperature, r1_products, r1_reactants)
+    dS2 = reaction_delta_s(temperature, r2_products, r2_reactants)
+    dG1 = dH1 - temperature * dS1 / 1000.0
+    dG2 = dH2 - temperature * dS2 / 1000.0
 
-    inner      = KMeOH * pA
-    sqrt_inner = np.sqrt(max(inner, 0.0))
-    num2       = ks * KMeOH**2 * (pA**2 - pE * pW / Ks_eq)
-    denom2     = max((1.0 + 2.0*sqrt_inner + KH2O*pW)**4, 1e-14)
-    r2_sol[i]  = (num2 / denom2) * 1000.0 / 3600.0 * rho_b
-
-    Qg_profile[i] = r1_sol[i] * (-dHrxn_1) + r2_sol[i] * (-dHrxn_2)
-
-W_sol = rho_b * V_sol
-XA = (FA0 - FA) / FA0
-XB = (FB0 - FB) / FB0
-
-P_bar_sol  = P_sol / 1e5
-P_ratio    = P_sol / P0
-deltaP_bar = (P0 - P_sol[-1]) / 1e5
-
-def to_kmh(F_mol_s):
-    return F_mol_s * 3600.0 / 1000.0
-
-# 9) HEAT DUTY
-# =============================================================================
-U = 600.0
-a = 4.0 / Dc
-
-Qr_profile = U * a * (T_sol - Ta_sol) / 1000.0
-Q_total_kJs = np.trapz(Qr_profile, V_sol)
-Q_total_MW = Q_total_kJs / 1000.0
+    return {
+        "dH1": dH1,
+        "dH2": dH2,
+        "dS1": dS1,
+        "dS2": dS2,
+        "dG1": dG1,
+        "dG2": dG2,
+        "Keq1": np.exp(-dG1 * 1000.0 / (R_GAS * temperature)),
+        "Keq2": np.exp(-dG2 * 1000.0 / (R_GAS * temperature)),
+    }
 
 
-# 10) PRINT SUMMARY
-# =============================================================================
-print("="*60)
-print(f"  Reaction Thermodynamics at T = {T0:.2f} K ({T0-273.15:.0f} °C)")
-print("="*60)
+def feed_flows(config: ReactorConfig) -> dict[str, float]:
+    """Return total plant inlet molar flows, mol/s."""
 
-# inlet thermodynamics only for reporting
-t0 = T0 / 1000.0
-
-def H_sensible0(c):
-    return c[0]*t0 + c[1]*t0**2/2 + c[2]*t0**3/3 + c[3]*t0**4/4 - c[4]/t0 + c[5] - c[7]
-
-def S_shomate0(c):
-    return c[0]*np.log(t0) + c[1]*t0 + c[2]*t0**2/2 + c[3]*t0**3/3 - c[4]/(2*t0**2) + c[6]
-
-def H_sensible_ref0(Tref, c):
-    tref = Tref / 1000.0
-    return c[0]*tref + c[1]*tref**2/2 + c[2]*tref**3/3 + c[3]*tref**4/4 - c[4]/tref + c[5] - c[7]
-
-def Cp_integral0(c):
-    return H_sensible0(c) - H_sensible_ref0(298.15, c)
-
-dHrxn1_0 = dHf_R1 + (Cp_integral0(c_MeCl) + Cp_integral0(c_H2O) - Cp_integral0(c_MeOH) - Cp_integral0(c_HCl))
-dHrxn2_0 = dHf_R2 + (Cp_integral0(c_DME) + Cp_integral0(c_H2O) - 2.0*Cp_integral0(c_MeOH))
-
-dSrxn1_0 = S_shomate0(c_MeCl) + S_shomate0(c_H2O) - S_shomate0(c_MeOH) - S_shomate0(c_HCl)
-dSrxn2_0 = S_shomate0(c_DME) + S_shomate0(c_H2O) - 2.0*S_shomate0(c_MeOH)
-
-dGrxn1_0 = dHrxn1_0 - T0 * dSrxn1_0 / 1000.0
-dGrxn2_0 = dHrxn2_0 - T0 * dSrxn2_0 / 1000.0
-
-Keq1_0 = np.exp(-dGrxn1_0 * 1000.0 / (R_gas * T0))
-Keq2_0 = np.exp(-dGrxn2_0 * 1000.0 / (R_gas * T0))
-
-for rxn in [1, 2]:
-    label = "R1: CH3OH+HCl→CH3Cl+H2O" if rxn == 1 else "R2: 2CH3OH→DME+H2O"
-    print(f"\n  {label}")
-    if rxn == 1:
-        print(f"    dH_rxn = {dHrxn1_0:+.4f}  kJ/mol")
-        print(f"    dS_rxn = {dSrxn1_0:+.4f}  J/mol/K")
-        print(f"    dG_rxn = {dGrxn1_0:+.4f}  kJ/mol")
-        print(f"    Keq    = {Keq1_0:.4f}")
-    else:
-        print(f"    dH_rxn = {dHrxn2_0:+.4f}  kJ/mol")
-        print(f"    dS_rxn = {dSrxn2_0:+.4f}  J/mol/K")
-        print(f"    dG_rxn = {dGrxn2_0:+.4f}  kJ/mol")
-        print(f"    Keq    = {Keq2_0:.4f}")
-
-print(f"\nTube diameter  = {Dc:.6f} m")
-print(f"Tube area      = {Ac:.8f} m2")
-print(f"Volume/tube    = {V_tube:.6f} m3")
-print(f"Number tubes   = {n_tubes}")
-print(f"W_catalyst tot = {W_total:.2f} kg")
-print(f"G              = {G:.6f} kg/m2/s")
-print(f"\nFinal MeOH conversion = {XA[-1]:.4f}")
-print(f"Final HCl  conversion = {XB[-1]:.4f}")
-print(f"Outlet pressure       = {P_bar_sol[-1]:.5f} bar")
-print(f"Total pressure drop   = {deltaP_bar:.5f} bar")
-print(f"Inlet  reactor temperature   = {T_sol[0]-273.15:.2f} °C")
-print(f"Outlet reactor temperature  = {T_sol[-1]-273.15:.2f} °C")
-print(f"Inlet  coolant temperature  = {Ta_sol[0]-273.15:.2f} °C")
-print(f"Outlet coolant temperature = {Ta_sol[-1]-273.15:.2f} °C")
-
-print(f"\n{'='*55}")
-print("OUTLET FLOWRATES (TOTAL PLANT, kmol/h)")
-print(f"{'='*55}")
-names   = ["Methanol (MeOH)", "HCl", "Methyl Chloride", "Water (H2O)", "DME"]
-outlets = [FA[-1], FB[-1], FP[-1], FW[-1], FE[-1]]
-for name, F in zip(names, outlets):
-    print(f"{name:<20} {to_kmh(F):>12.4f}")
-print(f"{'Total':<20} {sum(to_kmh(F) for F in outlets):>12.4f}")
-
-print("\n" + "="*50)
-print("HEAT DUTY")
-print("="*50)
-print(f"Total heat removed = {Q_total_kJs:.2f} kJ/s")
-print(f"Total heat removed = {Q_total_MW:.4f} MW")
+    meoh = config.meoh_feed_kmol_h * 1000.0 / 3600.0
+    hcl = meoh * config.hcl_to_meoh_ratio
+    return {"MeOH": meoh, "HCl": hcl, "MeCl": 0.0, "H2O": 0.0, "DME": 0.0}
 
 
+def mixture_molecular_weight(flows: np.ndarray) -> float:
+    """Mixture molecular weight, kg/mol."""
+
+    total_flow = float(np.sum(flows))
+    if total_flow <= SMALL:
+        inlet = feed_flows(ReactorConfig())
+        inlet_total = inlet["MeOH"] + inlet["HCl"]
+        return (inlet["MeOH"] * MOLECULAR_WEIGHT["MeOH"] + inlet["HCl"] * MOLECULAR_WEIGHT["HCl"]) / inlet_total
+
+    return sum(flow * MOLECULAR_WEIGHT[species] for flow, species in zip(flows, SPECIES)) / total_flow
+
+
+def build_geometry(config: ReactorConfig) -> Geometry:
+    """Calculate tube bundle and packed-bed hydrodynamic quantities."""
+
+    tube_diameter = config.tube_to_particle_diameter * config.particle_diameter
+    tube_area = np.pi * tube_diameter**2 / 4.0
+    tube_volume = tube_area * config.tube_length
+    tube_count = int(np.ceil(config.reactor_volume / tube_volume))
+    catalyst_mass_total = config.bulk_density * config.reactor_volume
+    catalyst_mass_per_tube = config.bulk_density * tube_volume
+
+    inlet = feed_flows(config)
+    total_mass_flow = inlet["MeOH"] * MOLECULAR_WEIGHT["MeOH"] + inlet["HCl"] * MOLECULAR_WEIGHT["HCl"]
+    mass_flux = (total_mass_flow / tube_count) / tube_area
+
+    eps = config.void_fraction
+    pressure_drop_alpha = (mass_flux / config.particle_diameter) * ((1.0 - eps) / eps**3) * (
+        150.0 * (1.0 - eps) * config.mixture_viscosity / config.particle_diameter + 1.75 * mass_flux
+    )
+
+    return Geometry(
+        tube_diameter=tube_diameter,
+        tube_area=tube_area,
+        tube_volume=tube_volume,
+        tube_count=tube_count,
+        catalyst_mass_total=catalyst_mass_total,
+        catalyst_mass_per_tube=catalyst_mass_per_tube,
+        mass_flux=mass_flux,
+        pressure_drop_alpha=pressure_drop_alpha,
+        total_cross_section=tube_area * tube_count,
+        heat_transfer_area_per_volume=4.0 / tube_diameter,
+    )
+
+
+def partial_pressures_bar(flows: np.ndarray, pressure_pa: float) -> dict[str, float]:
+    """Return gas partial pressures in bar."""
+
+    clipped_flows = np.maximum(flows, 0.0)
+    total_flow = float(np.sum(clipped_flows))
+    if total_flow <= SMALL:
+        return {species: 0.0 for species in SPECIES}
+
+    pressure_bar = max(pressure_pa, 1.0) / 1.0e5
+    return {species: flow / total_flow * pressure_bar for species, flow in zip(SPECIES, clipped_flows)}
+
+
+def local_rates(flows: np.ndarray, pressure_pa: float, temperature: float, config: ReactorConfig) -> LocalRates:
+    """Calculate reaction rates and heat generation at the local state."""
+
+    temperature = max(temperature, 10.0)
+    partials = partial_pressures_bar(flows, pressure_pa)
+    thermo = reaction_thermodynamics(temperature)
+
+    p_meoh = partials["MeOH"]
+    p_hcl = partials["HCl"]
+    p_mecl = partials["MeCl"]
+    p_h2o = partials["H2O"]
+    p_dme = partials["DME"]
+
+    k_a2 = (1.64e5 / 1.01325) * np.exp(-54.4e3 / (R_GAS * temperature))
+    k_hcl = (3.76e-5 / 1.01325) * np.exp(90.6e3 / (R_GAS * temperature))
+
+    k_s = 1.45088e3 * np.exp(-62338.37 / (R_GAS * temperature))
+    k_meoh = 9.75e-1 * np.exp(64150.82 / (R_GAS * temperature))
+    k_h2o = 6.53e-1 * np.exp(5868.85 / (R_GAS * temperature))
+
+    ratio1 = p_mecl**2 / max(p_meoh * thermo["Keq1"], SMALL)
+    num1 = k_a2 * (p_hcl - ratio1)
+    denom1 = max(1.0 + k_hcl * ratio1, SMALL)
+    r1 = (num1 / denom1) * 1000.0 / 3600.0 * config.bulk_density
+
+    sqrt_inner = np.sqrt(max(k_meoh * p_meoh, 0.0))
+    num2 = k_s * k_meoh**2 * (p_meoh**2 - p_dme * p_h2o / max(thermo["Keq2"], SMALL))
+    denom2 = max((1.0 + 2.0 * sqrt_inner + k_h2o * p_h2o) ** 4, SMALL)
+    r2 = (num2 / denom2) * 1000.0 / 3600.0 * config.bulk_density
+
+    heat_generation = (r1 * (-thermo["dH1"]) + r2 * (-thermo["dH2"])) * 1000.0
+    return LocalRates(r1=r1, r2=r2, dH1=thermo["dH1"], dH2=thermo["dH2"], heat_generation=heat_generation)
+
+
+def reactor_odes(volume: float, state: np.ndarray, config: ReactorConfig, geometry: Geometry) -> list[float]:
+    """Coupled species, pressure, reactor temperature, and coolant ODEs."""
+
+    del volume
+
+    flows = np.asarray(state[:5], dtype=float)
+    pressure = max(float(state[5]), 1.0)
+    temperature = max(float(state[6]), 10.0)
+    coolant_temperature = max(float(state[7]), 10.0)
+
+    if np.sum(np.maximum(flows, 0.0)) <= SMALL:
+        return [0.0] * 8
+
+    rates = local_rates(flows, pressure, temperature, config)
+
+    dflows_dv = np.array(
+        [
+            -rates.r1 - 2.0 * rates.r2,
+            -rates.r1,
+            rates.r1,
+            rates.r1 + rates.r2,
+            rates.r2,
+        ]
+    )
+
+    rho = pressure * mixture_molecular_weight(np.maximum(flows, 0.0)) / (R_GAS * temperature)
+    dpressure_dz = -geometry.pressure_drop_alpha / max(rho, 1.0e-12)
+    dpressure_dv = dpressure_dz / geometry.total_cross_section
+
+    heat_capacity_flow = sum(
+        max(flow, 0.0) * shomate_cp(SHOMATE[species], temperature) for flow, species in zip(flows, SPECIES)
+    )
+    heat_removed = config.overall_heat_transfer * geometry.heat_transfer_area_per_volume * (
+        temperature - coolant_temperature
+    )
+
+    dtemperature_dv = (rates.heat_generation - heat_removed) / max(heat_capacity_flow, 1.0e-12)
+    dcoolant_temperature_dv = heat_removed / max(config.coolant_mass_flow * config.coolant_heat_capacity, 1.0e-12)
+
+    return [*dflows_dv, dpressure_dv, dtemperature_dv, dcoolant_temperature_dv]
+
+
+def solve_reactor(config: ReactorConfig) -> dict[str, np.ndarray | ReactorConfig | Geometry]:
+    """Solve the reactor model and return profiles plus derived summaries."""
+
+    geometry = build_geometry(config)
+    inlet = feed_flows(config)
+    pressure0 = config.pressure_bar * 1.0e5
+
+    initial_state = [
+        inlet["MeOH"],
+        inlet["HCl"],
+        inlet["MeCl"],
+        inlet["H2O"],
+        inlet["DME"],
+        pressure0,
+        config.inlet_temperature,
+        config.coolant_inlet_temperature,
+    ]
+    volume_eval = np.linspace(0.0, config.reactor_volume, config.points)
+
+    solution = solve_ivp(
+        lambda volume, state: reactor_odes(volume, state, config, geometry),
+        (0.0, config.reactor_volume),
+        initial_state,
+        t_eval=volume_eval,
+        method="RK45",
+        rtol=config.rtol,
+        atol=config.atol,
+    )
+
+    if not solution.success:
+        raise RuntimeError(solution.message)
+
+    flows = solution.y[:5]
+    pressure = solution.y[5]
+    temperature = solution.y[6]
+    coolant_temperature = solution.y[7]
+
+    r1 = np.zeros_like(solution.t)
+    r2 = np.zeros_like(solution.t)
+    heat_generation = np.zeros_like(solution.t)
+    for index, values in enumerate(zip(flows.T, pressure, temperature)):
+        local_flow, local_pressure, local_temperature = values
+        rates = local_rates(local_flow, local_pressure, local_temperature, config)
+        r1[index] = rates.r1
+        r2[index] = rates.r2
+        heat_generation[index] = rates.heat_generation / 1000.0
+
+    heat_removed = (
+        config.overall_heat_transfer
+        * geometry.heat_transfer_area_per_volume
+        * (temperature - coolant_temperature)
+        / 1000.0
+    )
+
+    return {
+        "config": config,
+        "geometry": geometry,
+        "volume": solution.t,
+        "flows": flows,
+        "pressure": pressure,
+        "temperature": temperature,
+        "coolant_temperature": coolant_temperature,
+        "r1": r1,
+        "r2": r2,
+        "heat_generation": heat_generation,
+        "heat_removed": heat_removed,
+    }
+
+
+def kmol_per_hour(mol_per_second: float | np.ndarray) -> float | np.ndarray:
+    return mol_per_second * 3600.0 / 1000.0
+
+
+def summary_text(result: dict[str, np.ndarray | ReactorConfig | Geometry]) -> str:
+    """Format a concise model summary for console output."""
+
+    config = result["config"]
+    geometry = result["geometry"]
+    volume = result["volume"]
+    flows = result["flows"]
+    pressure = result["pressure"]
+    temperature = result["temperature"]
+    coolant_temperature = result["coolant_temperature"]
+    heat_removed = result["heat_removed"]
+
+    assert isinstance(config, ReactorConfig)
+    assert isinstance(geometry, Geometry)
+
+    inlet = feed_flows(config)
+    thermo0 = reaction_thermodynamics(config.inlet_temperature)
+
+    meoh_conversion = (inlet["MeOH"] - flows[0]) / inlet["MeOH"]
+    hcl_conversion = (inlet["HCl"] - flows[1]) / inlet["HCl"]
+    pressure_drop_bar = (config.pressure_bar * 1.0e5 - pressure[-1]) / 1.0e5
+    total_heat_removed_kjs = np.trapezoid(heat_removed, volume)
+    total_heat_removed_mw = total_heat_removed_kjs / 1000.0
+
+    lines = [
+        "=" * 68,
+        f"Reaction thermodynamics at T = {config.inlet_temperature:.2f} K",
+        "=" * 68,
+        "R1: CH3OH + HCl -> CH3Cl + H2O",
+        f"  dH_rxn = {thermo0['dH1']:+.4f} kJ/mol",
+        f"  dS_rxn = {thermo0['dS1']:+.4f} J/mol/K",
+        f"  dG_rxn = {thermo0['dG1']:+.4f} kJ/mol",
+        f"  Keq    = {thermo0['Keq1']:.4f}",
+        "",
+        "R2: 2 CH3OH -> DME + H2O",
+        f"  dH_rxn = {thermo0['dH2']:+.4f} kJ/mol",
+        f"  dS_rxn = {thermo0['dS2']:+.4f} J/mol/K",
+        f"  dG_rxn = {thermo0['dG2']:+.4f} kJ/mol",
+        f"  Keq    = {thermo0['Keq2']:.4f}",
+        "",
+        "=" * 68,
+        "Reactor geometry and performance",
+        "=" * 68,
+        f"Tube diameter        = {geometry.tube_diameter:.6f} m",
+        f"Tube area            = {geometry.tube_area:.8f} m2",
+        f"Volume per tube      = {geometry.tube_volume:.6f} m3",
+        f"Number of tubes      = {geometry.tube_count}",
+        f"Total catalyst mass  = {geometry.catalyst_mass_total:.2f} kg",
+        f"Mass flux            = {geometry.mass_flux:.6f} kg/m2/s",
+        "",
+        f"Final MeOH conversion = {meoh_conversion[-1]:.4f}",
+        f"Final HCl conversion  = {hcl_conversion[-1]:.4f}",
+        f"Outlet pressure       = {pressure[-1] / 1.0e5:.5f} bar",
+        f"Total pressure drop   = {pressure_drop_bar:.5f} bar",
+        f"Inlet reactor T       = {temperature[0] - 273.15:.2f} deg C",
+        f"Outlet reactor T      = {temperature[-1] - 273.15:.2f} deg C",
+        f"Inlet coolant T       = {coolant_temperature[0] - 273.15:.2f} deg C",
+        f"Outlet coolant T      = {coolant_temperature[-1] - 273.15:.2f} deg C",
+        "",
+        "=" * 68,
+        "Outlet flowrates, total plant",
+        "=" * 68,
+    ]
+
+    for species, flow in zip(SPECIES, flows[:, -1]):
+        lines.append(f"{species:<8} {kmol_per_hour(flow):>12.4f} kmol/h")
+    lines.append(f"{'Total':<8} {np.sum(kmol_per_hour(flows[:, -1])):>12.4f} kmol/h")
+
+    lines.extend(
+        [
+            "",
+            "=" * 68,
+            "Heat duty",
+            "=" * 68,
+            f"Total heat removed = {total_heat_removed_kjs:.2f} kJ/s",
+            f"Total heat removed = {total_heat_removed_mw:.4f} MW",
+        ]
+    )
+
+    return "\n".join(lines)
+
+
+def plot_profiles(result: dict[str, np.ndarray | ReactorConfig | Geometry], output_path: Path) -> None:
+    """Save a multi-panel profile plot."""
+
+    config = result["config"]
+    volume = result["volume"]
+    flows = result["flows"]
+    pressure = result["pressure"]
+    temperature = result["temperature"]
+    coolant_temperature = result["coolant_temperature"]
+    r1 = result["r1"]
+    r2 = result["r2"]
+    heat_generation = result["heat_generation"]
+    heat_removed = result["heat_removed"]
+
+    assert isinstance(config, ReactorConfig)
+
+    inlet = feed_flows(config)
+    meoh_conversion = (inlet["MeOH"] - flows[0]) / inlet["MeOH"]
+    hcl_conversion = (inlet["HCl"] - flows[1]) / inlet["HCl"]
+
+    fig, axes = plt.subplots(3, 2, figsize=(12, 11), constrained_layout=True)
+    fig.suptitle("Packed-bed methyl chloride reactor profiles", fontsize=14, fontweight="bold")
+
+    ax = axes[0, 0]
+    ax.plot(volume, meoh_conversion, label="MeOH")
+    ax.plot(volume, hcl_conversion, label="HCl")
+    ax.set_xlabel("Reactor volume, m3")
+    ax.set_ylabel("Conversion")
+    ax.set_ylim(bottom=0.0)
+    ax.grid(True, alpha=0.25)
+    ax.legend()
+
+    ax = axes[0, 1]
+    ax.plot(volume, temperature - 273.15, label="Reactor")
+    ax.plot(volume, coolant_temperature - 273.15, label="Coolant")
+    ax.set_xlabel("Reactor volume, m3")
+    ax.set_ylabel("Temperature, deg C")
+    ax.grid(True, alpha=0.25)
+    ax.legend()
+
+    ax = axes[1, 0]
+    ax.plot(volume, pressure / 1.0e5)
+    ax.set_xlabel("Reactor volume, m3")
+    ax.set_ylabel("Pressure, bar")
+    ax.grid(True, alpha=0.25)
+
+    ax = axes[1, 1]
+    ax.plot(volume, r1, label="R1")
+    ax.plot(volume, r2, label="R2")
+    ax.set_xlabel("Reactor volume, m3")
+    ax.set_ylabel("Rate, mol/m3/s")
+    ax.grid(True, alpha=0.25)
+    ax.legend()
+
+    ax = axes[2, 0]
+    ax.plot(volume, heat_generation, label="Generated")
+    ax.plot(volume, heat_removed, label="Removed")
+    ax.set_xlabel("Reactor volume, m3")
+    ax.set_ylabel("Heat rate, kJ/m3/s")
+    ax.grid(True, alpha=0.25)
+    ax.legend()
+
+    ax = axes[2, 1]
+    outlet_flows = kmol_per_hour(flows[:, -1])
+    colors = ["#3b82f6", "#ef4444", "#10b981", "#06b6d4", "#f59e0b"]
+    ax.bar(SPECIES, outlet_flows, color=colors)
+    ax.set_ylabel("Outlet flow, kmol/h")
+    ax.grid(True, axis="y", alpha=0.25)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Solve and plot a methyl chloride packed-bed reactor model.")
+    parser.add_argument("--volume", type=float, default=ReactorConfig.reactor_volume, help="Total reactor volume, m3.")
+    parser.add_argument("--hcl-ratio", type=float, default=ReactorConfig.hcl_to_meoh_ratio, help="HCl/MeOH feed ratio.")
+    parser.add_argument("--coolant-flow", type=float, default=ReactorConfig.coolant_mass_flow, help="Coolant mass flow, kg/s.")
+    parser.add_argument("--points", type=int, default=ReactorConfig.points, help="Number of solution points.")
+    parser.add_argument("--output-dir", type=Path, default=Path("outputs"), help="Directory for generated files.")
+    parser.add_argument("--no-plot", action="store_true", help="Print results without saving a plot.")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    config = replace(
+        ReactorConfig(),
+        reactor_volume=args.volume,
+        hcl_to_meoh_ratio=args.hcl_ratio,
+        coolant_mass_flow=args.coolant_flow,
+        points=args.points,
+    )
+
+    result = solve_reactor(config)
+    print(summary_text(result))
+
+    if not args.no_plot:
+        output_path = args.output_dir / "reactor_profiles.png"
+        plot_profiles(result, output_path)
+        print(f"\nSaved profile plot to: {output_path}")
+
+
+if __name__ == "__main__":
+    main()
