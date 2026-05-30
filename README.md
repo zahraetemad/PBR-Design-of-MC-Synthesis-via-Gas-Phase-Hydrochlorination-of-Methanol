@@ -33,7 +33,7 @@ pip install -r requirements.txt
 Run the base case:
 
 ```bash
-python reactor_model.py
+python pbr_methyl_chloride_model.py
 ```
 
 The script prints a performance summary and saves:
@@ -59,15 +59,15 @@ outputs/thermodynamics/reaction_thermodynamics.png
 ## Common Options
 
 ```bash
-python reactor_model.py --volume 10
-python reactor_model.py --hcl-ratio 1.7
-python reactor_model.py --coolant-flow 13
-python reactor_model.py --no-plot
+python pbr_methyl_chloride_model.py --volume 10
+python pbr_methyl_chloride_model.py --hcl-ratio 1.7
+python pbr_methyl_chloride_model.py --coolant-flow 13
+python pbr_methyl_chloride_model.py --no-plot
 ```
 
 ## Notes
 
-- Feed, geometry, coolant, and transport assumptions live in `ReactorConfig` inside `reactor_model.py`.
+- Feed, geometry, coolant, and transport assumptions live in `ReactorConfig` inside `pbr_methyl_chloride_model.py`.
 - HCl, CH3Cl, and H2O use full NIST Shomate coefficients.
 - CH3OH and DME use a Shomate-form regression against NIST Cp tables over 200-1500 K; `thermodynamics_regression.py` reproduces the fitted coefficients and plots the diagnostics.
 - Main-reaction kinetics follow Becerra, Castro Luna, Ardissone, and Ponzi, "Kinetics of the catalytic hydrochlorination of methanol to methyl chloride", Industrial & Engineering Chemistry Research, 1992, 31, 1040-1045.
