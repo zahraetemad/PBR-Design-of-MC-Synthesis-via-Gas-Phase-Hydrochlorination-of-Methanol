@@ -42,6 +42,20 @@ The script prints a performance summary and saves:
 outputs/reactor_profiles.png
 ```
 
+Run the thermodynamic regression and diagnostic plots:
+
+```bash
+python thermodynamics_regression.py
+```
+
+This saves:
+
+```text
+outputs/thermodynamics/cp_fits.png
+outputs/thermodynamics/species_thermodynamics.png
+outputs/thermodynamics/reaction_thermodynamics.png
+```
+
 ## Common Options
 
 ```bash
@@ -54,7 +68,10 @@ python reactor_model.py --no-plot
 ## Notes
 
 - Feed, geometry, coolant, and transport assumptions live in `ReactorConfig` inside `reactor_model.py`.
-- Main-reaction kinetics follow the hydrochlorination mechanism over gamma-alumina, and side-reaction kinetics follow catalytic methanol dehydration to DME over gamma-alumina.
+- HCl, CH3Cl, and H2O use full NIST Shomate coefficients.
+- CH3OH and DME use a Shomate-form regression against NIST Cp tables over 200-1500 K; `thermodynamics_regression.py` reproduces the fitted coefficients and plots the diagnostics.
+- Main-reaction kinetics follow Becerra, Castro Luna, Ardissone, and Ponzi, "Kinetics of the catalytic hydrochlorination of methanol to methyl chloride", Industrial & Engineering Chemistry Research, 1992, 31, 1040-1045.
+- Side-reaction kinetics follow Bercic and Levec, "Catalytic dehydration of methanol to dimethyl ether. Kinetic investigation and reactor simulation", Industrial & Engineering Chemistry Research, 1993, 32, 2478-2484.
 - The calculations are intended for engineering exploration and should be checked against validated kinetics, catalyst data, and plant design constraints before design use.
 - The coolant flow is treated as total plant coolant flow over the modeled reactor volume.
 
