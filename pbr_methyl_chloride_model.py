@@ -7,7 +7,7 @@ heat removal for:
     R2: 2 CH3OH     <-> DME + H2O
 
 Run:
-    python reactor_model.py
+    python pbr_methyl_chloride_model.py
 """
 
 from __future__ import annotations
@@ -19,11 +19,6 @@ from pathlib import Path
 
 os.environ.setdefault("MPLCONFIGDIR", str(Path.cwd() / ".matplotlib-cache"))
 
-import matplotlib
-
-matplotlib.use("Agg")
-
-import matplotlib.pyplot as plt
 import numpy as np
 from scipy.integrate import solve_ivp
 
@@ -37,6 +32,9 @@ T_REF = 298.15  # K
 SMALL = 1.0e-14
 
 SHOMATE = {
+    # HCl, MeCl, and H2O use published NIST Shomate coefficients. MeOH and
+    # DME use the same Shomate form fitted to NIST Cp tables; see
+    # thermodynamics_regression.py for the regression workflow.
     "HCl": np.array(
         [32.12392, -13.45805, 19.86852, -6.853936, -0.049672, -101.6206, 228.6866, -92.31201]
     ),
@@ -504,6 +502,12 @@ def summary_text(result: dict[str, np.ndarray | ReactorConfig | Geometry]) -> st
 
 def plot_profiles(result: dict[str, np.ndarray | ReactorConfig | Geometry], output_path: Path) -> None:
     """Save a multi-panel profile plot."""
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+
+    import matplotlib.pyplot as plt
 
     config = result["config"]
     volume = result["volume"]
